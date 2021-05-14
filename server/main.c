@@ -1,0 +1,253 @@
+// SERVER
+#define _GNU_SOURCE
+#include <stdio.h>      /* printf() */
+#include <stdlib.h>     /* atoi(), exit(), EXIT_SUCCESS */
+#include <unistd.h>     /* pause() */
+#include <errno.h>      /* errno, program_invocation_short_name */
+#include <string.h>     /* strerror() */
+#include <sys/socket.h> /* socket(), setsockopt(), connect() */
+#include <arpa/inet.h>  /* htons(), inet_pton() */
+#include <signal.h>     /* signal(), SIGINT */
+#include <sys/epoll.h>
+
+#define RED     "\x1b[1;31m"
+#define GREEN   "\x1b[1;32m"
+#define CYAN    "\x1b[1;36m"
+#define NORMAL  "\x1b[0m"
+
+static void syntax()
+{
+    fprintf(stderr, "Syntax:  %s PORT\n", program_invocation_short_name);
+}
+
+static volatile int stop = 0;
+static void sig_handler(int signo)
+{
+    stop = 1;
+}
+
+static int get_client_connection(uint16_t port, sigset_t sigmsk)
+{
+    int rc = 0;
+
+    printf("listensock = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0) -> ");
+    int listensock = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    printf("%d\n", listensock);
+
+    if (listensock < 0)
+    {
+        exit(EXIT_FAILURE);
+    }
+
+    // Forcefully attaching socket to the port
+    int opt = 1;
+    printf("setsockopt(listensock, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof opt) -> ");
+    rc = setsockopt(listensock, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof opt);
+    printf("%d\n", rc);
+    if (rc != 0)
+    {
+        fprintf(stderr, RED "setsockopt() failed: %m" NORMAL "\n");
+        exit(EXIT_FAILURE);
+    }
+
+    struct sockaddr_in address;
+    socklen_t          addrlen = sizeof address;
+    address.sin_family      = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port        = htons(port);
+
+    printf("bind(listensock, (struct sockaddr *)&address, sizeof(address)) -> ");
+    rc = bind(listensock, (struct sockaddr *)&address, sizeof(address));
+    printf("%d\n", rc);
+    if (rc < 0)
+    {
+        fprintf(stderr, RED "bind() failed: %m" NORMAL "\n");
+        exit(EXIT_FAILURE);
+    }
+
+    printf("listen(listensock, 1) -> ");
+    rc = listen(listensock, 1);
+    printf("%d\n", rc);
+    if (rc < 0)
+    {
+        fprintf(stderr, "\x1b[1;31listen() failed: %m\n");
+        exit(EXIT_FAILURE);
+    }
+
+    int epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (epfd == -1)
+    {
+        fprintf(stderr, "\x1b[1;31Could not create the listen epoll FD list. Aborting!\n");
+        exit(EXIT_FAILURE);
+    }
+
+    struct epoll_event  newPeerConnectionEvent;
+    memset(&newPeerConnectionEvent, 0, sizeof newPeerConnectionEvent);
+
+    struct epoll_event  processableEvents;
+    memset(&processableEvents, 0, sizeof processableEvents);
+
+    newPeerConnectionEvent.data.fd = listensock;
+    newPeerConnectionEvent.events  = EPOLLOUT | EPOLLIN | EPOLLERR | EPOLLRDHUP | EPOLLHUP;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, listensock, &newPeerConnectionEvent) == -1)
+    {
+        fprintf(stderr, "\x1b[1;31Could not add the socket FD to the epoll FD list. Aborting!\n");
+        exit(EXIT_FAILURE);
+    }
+
+    int numfds = epoll_pwait(epfd, &processableEvents, 1, -1, &sigmsk);
+    if (numfds < 0)
+    {
+        if (errno == EINTR)
+        {
+            return -1;
+        }
+        fprintf(stderr, "\x1b[1;31Serious error in epoll setup: epoll_wait() returned < 0 status! %m\n");
+        exit(EXIT_FAILURE);
+    }
+
+    if (numfds == 0)
+    {
+        fprintf(stderr, "\x1b[1;31Connection timed out!\n");
+        exit(EXIT_FAILURE);
+    }
+
+    socklen_t rc_len = sizeof rc;
+    if (getsockopt(listensock, SOL_SOCKET, SO_ERROR, (void *)&rc, &rc_len) < 0)
+    {
+        fprintf(stderr, "\x1b[1;31getsockopt() failed\n");
+        exit(EXIT_FAILURE);
+    }
+
+    if (rc != 0)
+    {
+        fprintf(stderr, "\x1b[1;31connect did not go through. rc=%d\n", rc);
+        exit(EXIT_FAILURE);
+    }
+
+    printf("clientfd = accept4(listensock, (struct sockaddr *)&address, &addrlen, SOCK_NONBLOCK | SOCK_CLOEXEC) -> ");
+    int clientfd = accept4(listensock, (struct sockaddr *)&address, &addrlen, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    printf("%d\n", clientfd);
+    if (clientfd < 0)
+    {
+        fprintf(stderr, "\x1b[1;31accept() failed: %m\n");
+        exit(EXIT_FAILURE);
+    }
+
+    epoll_ctl(epfd, EPOLL_CTL_DEL, listensock, NULL);
+    close(listensock);
+    close(epfd);
+
+    return clientfd;
+}
+
+int main(int argc, char *argv[])
+{
+    if (argc < 2)
+    {
+        syntax();
+        exit(EXIT_FAILURE);
+    }
+
+    sigset_t    sigmsk;
+    sigfillset(&sigmsk);
+    sigdelset(&sigmsk, SIGINT); // SIGINT -> CTRL-c
+    sigprocmask(SIG_SETMASK, &sigmsk, NULL);
+    signal(SIGINT, sig_handler); // CTRL-c
+    setvbuf(stdout, NULL, _IONBF, 0);
+
+    int rc     = 0;
+    int status = EXIT_SUCCESS;
+    do
+    {
+        printf("\n-------------------------------------------------------------------------------\n");
+        int clientfd = get_client_connection((uint16_t)atoi(argv[1]), sigmsk);
+
+        if (stop) break;
+
+        struct sockaddr_in  addr;
+        socklen_t           addrlen = sizeof(addr);
+        printf("getpeername(clientfd, (struct sockaddr *)&addr, &addrlen) -> ");
+        rc = getpeername(clientfd, (struct sockaddr *)&addr, &addrlen);
+        if (rc == 0)
+        {
+            printf(GREEN "%m" NORMAL "\n");
+            printf("New client: " CYAN "%s" NORMAL ":%hu\n", inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
+        }
+        else
+        {
+            printf(RED "%m" NORMAL "\n");
+            printf("New client: unable to retrieve address\n");
+        }
+
+        struct epoll_event  processableEvents;
+        memset(&processableEvents, 0, sizeof processableEvents);
+
+        struct epoll_event  newPeerConnectionEvent;
+        memset(&newPeerConnectionEvent, 0, sizeof newPeerConnectionEvent);
+
+        int epfd = epoll_create1(EPOLL_CLOEXEC);
+        if (epfd == -1)
+        {
+            fprintf(stderr, "\x1b[1;31Could not create the read epoll FD list. Aborting!\n");
+            exit(EXIT_FAILURE);
+        }
+
+        newPeerConnectionEvent.data.fd = clientfd;
+        newPeerConnectionEvent.events  = EPOLLIN | EPOLLERR | EPOLLRDHUP | EPOLLHUP;
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, clientfd, &newPeerConnectionEvent) == -1)
+        {
+            fprintf(stderr, RED "Could not add the socket FD to the epoll FD list. Aborting!" NORMAL "\n");
+            exit(EXIT_FAILURE);
+        }
+
+        char buffer[1024] = {0};
+        while (!stop)
+        {
+            int numfds = epoll_pwait(epfd, &processableEvents, 1, -1, &sigmsk);
+
+            if (stop) break;
+
+            if (numfds < 0)
+            {
+                fprintf(stderr, RED "Serious error in epoll setup: epoll_wait() returned < 0 status! %m" NORMAL "\n");
+                status = EXIT_FAILURE;
+                stop = 1;
+                break;
+            }
+
+            if (numfds == 0)
+            {
+                fprintf(stderr, RED "Timeout" NORMAL "\n");
+                status = EXIT_FAILURE;
+                stop = 1;
+                break;
+            }
+
+            printf("recv(clientfd, buffer, 1024, 0) -> ");
+            int n = recv(clientfd, buffer, 1024, 0);
+            printf("%d", n);
+            if (n > 0)
+            {
+                printf(" - %.*s\n", n, buffer);
+            }
+            else if (n == 0)
+            {
+                printf(" - Connection closed by client\n");
+                break;
+            }
+            else
+            {
+                printf(" - " RED "%m" NORMAL "\n");
+                break;
+            }
+        }
+
+        close(clientfd);
+        close(epfd);
+
+    } while (!stop);
+
+    exit(status);
+}
+
