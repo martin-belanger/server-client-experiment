@@ -26,23 +26,22 @@ static void sig_handler(int signo)
     stop = 1;
 }
 
-static int get_client_connection(uint16_t port, sigset_t sigmsk)
+static int get_listen_sock4(uint16_t port)
 {
     int rc = 0;
 
-    printf("listensock = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0) -> ");
-    int listensock = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    printf("%d\n", listensock);
+    printf("listensock4 = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0) -> ");
+    int listensock4 = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    printf("%d\n", listensock4);
 
-    if (listensock < 0)
+    if (listensock4 < 0)
     {
         exit(EXIT_FAILURE);
     }
 
-    // Forcefully attaching socket to the port
     int opt = 1;
-    printf("setsockopt(listensock, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof opt) -> ");
-    rc = setsockopt(listensock, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof opt);
+    printf("setsockopt(listensock4, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof opt) -> ");
+    rc = setsockopt(listensock4, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof opt);
     printf("%d\n", rc);
     if (rc != 0)
     {
@@ -50,14 +49,13 @@ static int get_client_connection(uint16_t port, sigset_t sigmsk)
         exit(EXIT_FAILURE);
     }
 
-    struct sockaddr_in address;
-    socklen_t          addrlen = sizeof address;
+    struct sockaddr_in  address;
     address.sin_family      = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port        = htons(port);
 
-    printf("bind(listensock, (struct sockaddr *)&address, sizeof(address)) -> ");
-    rc = bind(listensock, (struct sockaddr *)&address, sizeof(address));
+    printf("bind(listensock4, (struct sockaddr *)&address, sizeof(address)) -> ");
+    rc = bind(listensock4, (struct sockaddr *)&address, sizeof(address));
     printf("%d\n", rc);
     if (rc < 0)
     {
@@ -65,14 +63,73 @@ static int get_client_connection(uint16_t port, sigset_t sigmsk)
         exit(EXIT_FAILURE);
     }
 
-    printf("listen(listensock, 1) -> ");
-    rc = listen(listensock, 1);
+    printf("listen(listensock4, 1) -> ");
+    rc = listen(listensock4, 1);
     printf("%d\n", rc);
     if (rc < 0)
     {
         fprintf(stderr, "\x1b[1;31listen() failed: %m\n");
         exit(EXIT_FAILURE);
     }
+
+    return listensock4;
+}
+
+static int get_listen_sock6(uint16_t port)
+{
+    int rc = 0;
+
+    printf("listensock6 = socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP) -> ");
+    int listensock6 = socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
+    printf("%d\n", listensock6);
+
+    if (listensock6 < 0)
+    {
+        exit(EXIT_FAILURE);
+    }
+
+    int opt = 1;
+    printf("setsockopt(listensock6, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof opt) -> ");
+    rc = setsockopt(listensock6, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof opt);
+    printf("%d\n", rc);
+    if (rc != 0)
+    {
+        fprintf(stderr, RED "setsockopt() failed: %m" NORMAL "\n");
+        exit(EXIT_FAILURE);
+    }
+
+    struct sockaddr_in6 address;
+    address.sin6_family = AF_INET6;
+    address.sin6_addr = in6addr_any;
+    address.sin6_port = htons(port);
+
+    printf("bind(listensock6, (struct sockaddr *)&address, sizeof(address)) -> ");
+    rc = bind(listensock6, (struct sockaddr *)&address, sizeof(address));
+    printf("%d\n", rc);
+    if (rc < 0)
+    {
+        fprintf(stderr, RED "bind() failed: %m" NORMAL "\n");
+        exit(EXIT_FAILURE);
+    }
+
+    printf("listen(listensock6, 1) -> ");
+    rc = listen(listensock6, 1);
+    printf("%d\n", rc);
+    if (rc < 0)
+    {
+        fprintf(stderr, "\x1b[1;31listen() failed: %m\n");
+        exit(EXIT_FAILURE);
+    }
+
+    return listensock6;
+}
+
+static int get_client_connection(uint16_t port, sigset_t sigmsk, struct sockaddr_storage * client_address)
+{
+    int rc = 0;
+
+    int listensock4 = get_listen_sock4(port);
+    int listensock6 = get_listen_sock6(port);
 
     int epfd = epoll_create1(EPOLL_CLOEXEC);
     if (epfd == -1)
@@ -82,19 +139,27 @@ static int get_client_connection(uint16_t port, sigset_t sigmsk)
     }
 
     struct epoll_event  newPeerConnectionEvent;
+
     memset(&newPeerConnectionEvent, 0, sizeof newPeerConnectionEvent);
-
-    struct epoll_event  processableEvents;
-    memset(&processableEvents, 0, sizeof processableEvents);
-
-    newPeerConnectionEvent.data.fd = listensock;
+    newPeerConnectionEvent.data.fd = listensock4;
     newPeerConnectionEvent.events  = EPOLLOUT | EPOLLIN | EPOLLERR | EPOLLRDHUP | EPOLLHUP;
-    if (epoll_ctl(epfd, EPOLL_CTL_ADD, listensock, &newPeerConnectionEvent) == -1)
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, listensock4, &newPeerConnectionEvent) == -1)
     {
-        fprintf(stderr, "\x1b[1;31Could not add the socket FD to the epoll FD list. Aborting!\n");
+        fprintf(stderr, "\x1b[1;31Could not add listensock4 to the epoll FD list. Aborting!\n");
         exit(EXIT_FAILURE);
     }
 
+    memset(&newPeerConnectionEvent, 0, sizeof newPeerConnectionEvent);
+    newPeerConnectionEvent.data.fd = listensock6;
+    newPeerConnectionEvent.events  = EPOLLOUT | EPOLLIN | EPOLLERR | EPOLLRDHUP | EPOLLHUP;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, listensock6, &newPeerConnectionEvent) == -1)
+    {
+        fprintf(stderr, "\x1b[1;31Could not add listensock6 to the epoll FD list. Aborting!\n");
+        exit(EXIT_FAILURE);
+    }
+
+    struct epoll_event  processableEvents;
+    memset(&processableEvents, 0, sizeof processableEvents);
     int numfds = epoll_pwait(epfd, &processableEvents, 1, -1, &sigmsk);
     if (numfds < 0)
     {
@@ -113,7 +178,7 @@ static int get_client_connection(uint16_t port, sigset_t sigmsk)
     }
 
     socklen_t rc_len = sizeof rc;
-    if (getsockopt(listensock, SOL_SOCKET, SO_ERROR, (void *)&rc, &rc_len) < 0)
+    if (getsockopt(processableEvents.data.fd, SOL_SOCKET, SO_ERROR, (void *)&rc, &rc_len) < 0)
     {
         fprintf(stderr, "\x1b[1;31getsockopt() failed\n");
         exit(EXIT_FAILURE);
@@ -125,8 +190,12 @@ static int get_client_connection(uint16_t port, sigset_t sigmsk)
         exit(EXIT_FAILURE);
     }
 
-    printf("clientfd = accept4(listensock, (struct sockaddr *)&address, &addrlen, SOCK_NONBLOCK | SOCK_CLOEXEC) -> ");
-    int clientfd = accept4(listensock, (struct sockaddr *)&address, &addrlen, SOCK_NONBLOCK | SOCK_CLOEXEC);
+
+    socklen_t    addrlen = sizeof(*client_address);
+    const char * sock_name_p = processableEvents.data.fd == listensock4 ? "listensock4" : "listensock6";
+
+    printf("clientfd = accept4(%s, (struct sockaddr *)&client_address, &addrlen, SOCK_NONBLOCK | SOCK_CLOEXEC) -> ", sock_name_p);
+    int clientfd = accept4(processableEvents.data.fd, (struct sockaddr *)client_address, &addrlen, SOCK_NONBLOCK | SOCK_CLOEXEC);
     printf("%d\n", clientfd);
     if (clientfd < 0)
     {
@@ -134,8 +203,10 @@ static int get_client_connection(uint16_t port, sigset_t sigmsk)
         exit(EXIT_FAILURE);
     }
 
-    epoll_ctl(epfd, EPOLL_CTL_DEL, listensock, NULL);
-    close(listensock);
+    epoll_ctl(epfd, EPOLL_CTL_DEL, listensock4, NULL);
+    epoll_ctl(epfd, EPOLL_CTL_DEL, listensock6, NULL);
+    close(listensock4);
+    close(listensock6);
     close(epfd);
 
     return clientfd;
@@ -156,32 +227,29 @@ int main(int argc, char *argv[])
     signal(SIGINT, sig_handler); // CTRL-c
     setvbuf(stdout, NULL, _IONBF, 0);
 
-    int rc     = 0;
     int status = EXIT_SUCCESS;
     do
     {
         printf("\n-------------------------------------------------------------------------------\n");
-        int clientfd = get_client_connection((uint16_t)atoi(argv[1]), sigmsk);
+        struct sockaddr_storage client_addr;
+        memset(&client_addr, 0, sizeof(client_addr));
+        int clientfd = get_client_connection((uint16_t)atoi(argv[1]), sigmsk, &client_addr);
 
         if (stop) break;
 
-        struct sockaddr_in  addr;
-        socklen_t           addrlen = sizeof(addr);
-        printf("getpeername(clientfd, (struct sockaddr *)&addr, &addrlen) -> ");
-        rc = getpeername(clientfd, (struct sockaddr *)&addr, &addrlen);
-        if (rc == 0)
-        {
-            printf(GREEN "%m" NORMAL "\n");
-            printf("New client: " CYAN "%s" NORMAL ":%hu\n", inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
-        }
-        else
-        {
-            printf(RED "%m" NORMAL "\n");
-            printf("New client: unable to retrieve address\n");
-        }
+        printf(GREEN "%m" NORMAL "\n");
 
-        struct epoll_event  processableEvents;
-        memset(&processableEvents, 0, sizeof processableEvents);
+        char buf[INET6_ADDRSTRLEN];
+        void     * src  = &((struct sockaddr_in *)&client_addr)->sin_addr;
+        uint16_t   port = ((struct sockaddr_in *)&client_addr)->sin_port;
+        if (client_addr.ss_family == AF_INET6)
+        {
+            src  = &((struct sockaddr_in6 *)&client_addr)->sin6_addr;
+            port = ((struct sockaddr_in6 *)&client_addr)->sin6_port;
+        }
+        printf("New client: " CYAN "%s" NORMAL ":%hu\n",
+               inet_ntop(client_addr.ss_family, src, buf, sizeof(buf)),
+               ntohs(port));
 
         struct epoll_event  newPeerConnectionEvent;
         memset(&newPeerConnectionEvent, 0, sizeof newPeerConnectionEvent);
@@ -204,6 +272,8 @@ int main(int argc, char *argv[])
         char buffer[1024] = {0};
         while (!stop)
         {
+            struct epoll_event  processableEvents;
+            memset(&processableEvents, 0, sizeof processableEvents);
             int numfds = epoll_pwait(epfd, &processableEvents, 1, -1, &sigmsk);
 
             if (stop) break;

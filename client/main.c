@@ -10,6 +10,8 @@
 #include <signal.h>     /* signal(), SIGINT */
 #include <sys/epoll.h>
 #include <argp.h>
+#include <netdb.h>
+#include <net/if.h>
 
 #define RED     "\x1b[1;31m"
 #define GREEN   "\x1b[1;32m"
@@ -31,22 +33,28 @@ static struct argp_option options[] =
 struct arguments
 {
     uint16_t     port;
-    const char * addr_p;
-    char       * interface_p;
-    char       * srce_addr_p;
+    const char *addr_p;
+    char       *interface_p;
+    char       *srce_addr_p;
 };
 
-static error_t parse_opt(int key, char *arg, struct argp_state *state) {
-    struct arguments * arguments = state->input;
-    switch (key) {
-    case 'i': arguments->interface_p = arg; break;
-    case 's': arguments->srce_addr_p = arg; break;
+static error_t parse_opt(int key, char *arg, struct argp_state *state)
+{
+    struct arguments *arguments = state->input;
+    switch (key)
+    {
+    case 'i':
+        arguments->interface_p = arg; break;
+    case 's':
+        arguments->srce_addr_p = arg; break;
 
     case ARGP_KEY_ARG:
         switch (state->arg_num)
         {
-        case 0: arguments->addr_p = arg; break;
-        case 1: arguments->port   = (uint16_t)atoi(arg); break;
+        case 0:
+            arguments->addr_p = arg; break;
+        case 1:
+            arguments->port   = (uint16_t)atoi(arg); break;
         default:
             fprintf(stderr, RED "Too many arguments" NORMAL "\n");
             argp_usage(state);  /* Too many arguments. */
@@ -61,7 +69,8 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
         }
         break;
 
-    default: return ARGP_ERR_UNKNOWN;
+    default:
+        return ARGP_ERR_UNKNOWN;
     }
     return 0;
 }
@@ -75,22 +84,110 @@ static void sig_handler(int signo)
     stop = 1;
 }
 
+static int inet4_pton(const char *src, uint16_t port, struct sockaddr_storage *addr)
+{
+    struct sockaddr_in *addr4 = (struct sockaddr_in *)addr;
+
+    if (strlen(src) > INET_ADDRSTRLEN) return -EINVAL;
+
+    if (inet_pton(AF_INET, src, &addr4->sin_addr.s_addr) <= 0) return -EINVAL;
+
+    addr4->sin_family = AF_INET;
+    addr4->sin_port   = htons(port);
+
+    return 0;
+}
+
+static int inet6_pton(const char *src, uint16_t port, struct sockaddr_storage *addr)
+{
+    int                  ret   = -EINVAL;
+    struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *)addr;
+
+    if (strlen(src) > INET6_ADDRSTRLEN) return -EINVAL;
+
+    char  *tmp = strdup(src);
+    if (!tmp) fprintf(stderr, RED "cannot copy: %s" NORMAL "\n", src);
+
+    const char *scope = NULL;
+    char *p = strchr(tmp, SCOPE_DELIMITER);
+    if (p)
+    {
+        *p = '\0';
+        scope = src + (p - tmp) + 1;
+    }
+
+    if (inet_pton(AF_INET6, tmp, &addr6->sin6_addr) != 1)
+    {
+        fprintf(stderr, RED "invalid source address: %s" NORMAL "\n", src);
+        goto free_tmp;
+    }
+
+    if (IN6_IS_ADDR_LINKLOCAL(&addr6->sin6_addr) && scope)
+    {
+        addr6->sin6_scope_id = if_nametoindex(scope);
+        if (addr6->sin6_scope_id == 0)
+        {
+            fprintf(stderr, RED "can't find iface index for: %s (%m)" NORMAL "\n", scope);
+            goto free_tmp;
+        }
+    }
+
+    addr6->sin6_family = AF_INET6;
+    addr6->sin6_port   = htons(port);
+    ret = 0;
+
+free_tmp:
+    free(tmp);
+    return ret;
+}
+
+/**
+ * inet_pton_with_scope - convert an IPv4/IPv6 to socket address
+ * @af: address family, AF_INET, AF_INET6 or AF_UNSPEC for either
+ * @src: the start of the address string
+ * @addr: output socket address
+ *
+ * Return 0 on success, errno otherwise.
+ */
+static int inet_pton_with_scope(int af, const char *src,
+                                uint16_t port, struct sockaddr_storage *addr)
+{
+    int rc = -EINVAL;
+
+    memset(addr, 0, sizeof(*addr));
+    switch (af)
+    {
+    case AF_INET:   return inet4_pton(src, port, addr);
+    case AF_INET6:  return inet6_pton(src, port, addr);
+    case AF_UNSPEC:
+        rc = inet4_pton(src, port, addr);
+        if (rc != 0)
+        {
+            memset(addr, 0, sizeof(*addr));
+            rc = inet6_pton(src, port, addr);
+        }
+
+        break;
+    default:
+        fprintf(stderr, RED "unexpected address family %d" NORMAL "\n", af);
+    }
+
+    return rc;
+}
+
 static int connect_to_server(const char *addr_p, uint16_t port, const char *interface_p, const char *srce_addr_p)
 {
-    int                 rc = 0;
-    struct sockaddr_in  serv_addr;
-
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port   = htons(port);
-
-    if (inet_pton(AF_INET, addr_p, &serv_addr.sin_addr) <= 0)
+    int                     rc = 0;
+    struct sockaddr_storage serv_addr;
+    rc = inet_pton_with_scope(AF_UNSPEC, addr_p, port, &serv_addr);
+    if (rc != 0)
     {
         fprintf(stderr, RED "Invalid address %s" NORMAL "\n", addr_p);
         exit(EXIT_FAILURE);
     }
 
-    printf("serverfd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0) -> ");
-    int serverfd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    printf("serverfd = socket(AF_INET%s, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0) -> ", serv_addr.ss_family == AF_INET ? "" : "6");
+    int serverfd = socket(serv_addr.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     printf("%d\n", serverfd);
 
     // =================================================================
@@ -105,13 +202,18 @@ static int connect_to_server(const char *addr_p, uint16_t port, const char *inte
 
     // =================================================================
     // Set source address: bind()-before-connect()
-    struct sockaddr_in addr;
-    socklen_t          addrlen = sizeof(addr);
     if (srce_addr_p)
     {
-        memset(&addr, 0, sizeof(addr));
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = inet_addr(srce_addr_p);
+        struct sockaddr_storage  addr;
+        rc = inet_pton_with_scope(AF_UNSPEC, srce_addr_p, 0, &addr);
+        if (rc != 0)
+        {
+            fprintf(stderr, RED "Invalid source address %s" NORMAL "\n", srce_addr_p);
+            exit(EXIT_FAILURE);
+        }
+
+        socklen_t addrlen = addr.ss_family == AF_INET ? sizeof(struct sockaddr_in)
+                                                      : sizeof(struct sockaddr_in6);
 
         printf("bind(serverfd, %s, %d) -> ", srce_addr_p, addrlen);
         errno = 0;
@@ -120,7 +222,7 @@ static int connect_to_server(const char *addr_p, uint16_t port, const char *inte
     }
 
     printf("connect(serverfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr) -> ");
-    rc = connect(serverfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr));
+    rc = connect(serverfd, (struct sockaddr *)&serv_addr, serv_addr.ss_family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6));
     printf("%s%m" NORMAL "\n", rc ? errno == EINPROGRESS ? "\x1b[1;93m" : RED : GREEN);
 
     if (rc != 0)
@@ -191,11 +293,25 @@ static int connect_to_server(const char *addr_p, uint16_t port, const char *inte
 
     printf("Connected to server\n");
 
-    printf("getsockname(serverfd, (struct sockaddr *)&addr, &addrlen) -> ");
+    struct sockaddr_storage client_addr;
+    socklen_t               addrlen = sizeof(client_addr);
+
+    printf("getsockname(serverfd, (struct sockaddr *)&client_address, &addrlen) -> ");
     errno = 0;
-    rc = getsockname(serverfd, (struct sockaddr *)&addr, &addrlen);
+    rc = getsockname(serverfd, (struct sockaddr *)&client_addr, &addrlen);
     printf("%s%m" NORMAL "\n", rc != 0 ? RED : GREEN);
-    printf("This sock is: " CYAN "%s" NORMAL ":%d\n", inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
+
+    char       buf[INET6_ADDRSTRLEN];
+    void      *client_addr_p = &((struct sockaddr_in *)&client_addr)->sin_addr;
+    uint16_t   client_port   = ((struct sockaddr_in *)&client_addr)->sin_port;
+    if (client_addr.ss_family == AF_INET6)
+    {
+        client_addr_p  = &((struct sockaddr_in6 *)&client_addr)->sin6_addr;
+        client_port = ((struct sockaddr_in6 *)&client_addr)->sin6_port;
+    }
+    printf("This sock is: " CYAN "%s" NORMAL ":%d\n",
+           inet_ntop(client_addr.ss_family, client_addr_p, buf, sizeof(buf)),
+           ntohs(client_port));
 
     return serverfd;
 }
@@ -211,9 +327,10 @@ int main(int argc, char *argv[])
     arguments.interface_p = NULL;
     arguments.srce_addr_p = NULL;
 
-    argp_parse (&argp, argc, argv, 0, 0, &arguments);
+    argp_parse(&argp, argc, argv, 0, 0, &arguments);
 
-    int serverfd = connect_to_server(arguments.addr_p, arguments.port, arguments.interface_p, arguments.srce_addr_p);
+    int serverfd = connect_to_server(arguments.addr_p, arguments.port,
+                                     arguments.interface_p, arguments.srce_addr_p);
     if (serverfd > 0)
     {
         while (!stop)
